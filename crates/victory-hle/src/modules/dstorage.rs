@@ -798,7 +798,20 @@ extern "system" fn close(this: QueueRef) {
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
+        // Which file the request read from (file sources only), to tell a
+        // bad offset from bad data on disk.
+        let file = if options & MEMORY_SOURCE == 0 {
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|(f, _)| *f == request.source as usize)
+                .map_or_else(|| "?".to_owned(), |(_, n)| n.clone())
+        } else {
+            "memory".to_owned()
+        };
         tracing::warn!(
+            file,
             options = format_args!("{options:#x}"),
             offset = request.offset,
             source_size = request.source_size,
