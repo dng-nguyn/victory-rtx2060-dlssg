@@ -794,6 +794,15 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Compressed blocks passed as zeros because they were all zeros on disk.
+static ZERO_HOLES: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_DSTORAGE_ZERO_HOLES=1`: see `execute`. Off by default.
+fn zero_holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_ZERO_HOLES").is_some_and(|v| v == "1"))
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -842,6 +851,26 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    // A compressed block that is all zeros on disk is a hole in an incomplete
+    // dump, not data: with `VICTORY_DSTORAGE_ZERO_HOLES=1` the destination is
+    // zeroed and the request succeeds, so the title goes on without that
+    // block (a missing animation or texture) instead of stopping at it.
+    if zero_holes() && !source.is_empty() && source.iter().all(|&b| b == 0) {
+        let n = ZERO_HOLES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            tracing::warn!(
+                holes = n,
+                offset = request.offset,
+                source_size = request.source_size,
+                "dstorage: a compressed block is all zeros on disk (a hole in the dump); zeroed and passed"
+            );
+        }
+        return into_destination(request, size, |out| {
+            out.fill(0);
+            Ok(out.len())
+        })
+        .map_err(|hr| fail(hr, "zeroing a hole"));
+    }
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
