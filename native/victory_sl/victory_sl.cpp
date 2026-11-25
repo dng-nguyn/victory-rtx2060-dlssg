@@ -115,7 +115,12 @@ VSL_API int vsl_init(const wchar_t* pluginDir, const wchar_t* logPath) {
     sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
     pref.featuresToLoad = features;
     pref.numFeaturesToLoad = 3;
+    // No NVIDIA application id: NGX (which DLSS-G needs) then wants the
+    // engine's version and a project GUID, or it disables every NGX feature
+    // ("Please provide correct application id when calling slInit").
     pref.engine = sl::EngineType::eCustom;
+    pref.engineVersion = "1.0.0";
+    pref.projectId = "c6a3dbdc-bb28-4a3e-8316-a32bd8a3df73";
     pref.renderAPI = sl::RenderAPI::eD3D12;
     sl::Result r = slInit(pref);
     logf("slInit -> %d", (int)r);
