@@ -961,6 +961,21 @@ fn zero_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_ZERO_HOLES").is_some_and(|v| v == "1"))
 }
 
+/// A run of zeros this long inside a compressed block marks a hole in it.
+const PARTIAL_HOLE_RUN: usize = 4096;
+
+/// Whether `bytes` holds `run` zero bytes in a row.
+fn has_zero_run(bytes: &[u8], run: usize) -> bool {
+    let mut count = 0;
+    for &b in bytes {
+        count = if b == 0 { count + 1 } else { 0 };
+        if count >= run {
+            return true;
+        }
+    }
+    false
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1046,20 +1061,50 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         })
         .map_err(|hr| fail(hr, "zeroing a hole"));
     }
+    // A block that a hole starts or ends inside: valid at one end, then a
+    // long run of zeros (compressed data has none that long). It is only
+    // treated as a hole if it then fails to decode.
+    let partly_holed = zero_holes() && has_zero_run(&source, PARTIAL_HOLE_RUN);
+    let passed_hole = |out: &mut [u8]| -> Result<usize, HRESULT> {
+        let n = ZERO_HOLES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            tracing::warn!(
+                holes = n,
+                offset = request.offset,
+                source_size = request.source_size,
+                "dstorage: a compressed block with a hole in it (zeros on disk) failed to decode; zeroed and passed"
+            );
+        }
+        out.fill(0);
+        Ok(out.len())
+    };
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        match inflate(&source, &mut packed) {
+            Ok(n) => {
+                packed.truncate(n);
+                Cow::Owned(packed)
+            }
+            Err(_) if partly_holed => {
+                return into_destination(request, size, passed_hole).map_err(|hr| fail(hr, "zeroing a hole"));
+            }
+            Err(hr) => return Err(fail(hr, "zlib")),
+        }
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        Some(tables) => match bcpack::decode(bc, &source, out, tables) {
+            Ok(()) => Ok(out.len()),
+            Err(_) if partly_holed => passed_hole(out),
+            Err(e) => Err(fail(INVALID_DATA, &e.to_string())),
+        },
+        None => match inflate(&source, out) {
+            Ok(n) => Ok(n),
+            Err(_) if partly_holed => passed_hole(out),
+            Err(hr) => Err(fail(hr, "zlib")),
+        },
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1359,6 +1404,18 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// A hole inside a block is a long run of zeros; short runs are data.
+    #[test]
+    fn zero_runs_mark_holes_only_when_long() {
+        let mut block = vec![0x78, 0xda, 1, 2, 3];
+        block.extend(std::iter::repeat_n(0, PARTIAL_HOLE_RUN - 1));
+        block.push(9);
+        assert!(!has_zero_run(&block, PARTIAL_HOLE_RUN));
+        block.extend(std::iter::repeat_n(0, PARTIAL_HOLE_RUN));
+        assert!(has_zero_run(&block, PARTIAL_HOLE_RUN));
+        assert!(!has_zero_run(&[], PARTIAL_HOLE_RUN));
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
