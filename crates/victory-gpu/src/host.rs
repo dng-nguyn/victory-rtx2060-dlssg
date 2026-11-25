@@ -5861,6 +5861,28 @@ impl Host {
         number
     }
 
+    /// Waits for a direct queue fence with the shared event, under the submission lock.
+    fn wait_for_submission(&self, target: u64, started: std::time::Instant, context: &str) {
+        // SAFETY: the fence and event are ours, and the submission lock
+        // prevents another wait from using this event.
+        unsafe {
+            if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                fail(format_args!("could not register a direct fence wait for {context} ({e})"));
+            }
+            working(false);
+            match WaitForSingleObject(self.event, INFINITE) {
+                WAIT_OBJECT_0 => {}
+                WAIT_FAILED => {
+                    let error = windows::core::Error::from_thread();
+                    fail(format_args!("could not wait for {context} ({error})"));
+                }
+                status => fail(format_args!("unexpected direct fence wait result for {context} ({:#x})", status.0)),
+            }
+            stood(started);
+            working(true);
+        }
+    }
+
     /// Waits for the card to run every flight in the air ([`late`]) and
     /// does what they left to do, as [`Host::execute`] does for one
     /// submission after its wait: the pieces their shaders wrote in copies
@@ -5911,19 +5933,7 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                self.wait_for_submission(*submitted, waiting, "submissions sent ahead");
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -6212,20 +6222,11 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
             }
+            self.wait_for_submission(*submitted, started, "a synchronous host submission");
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
