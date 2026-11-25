@@ -369,4 +369,16 @@ mod tests {
         assert!(unsafe { find_upscale(&lone) }.is_none());
         assert!(unsafe { find_upscale(std::ptr::null()) }.is_none());
     }
+
+    /// The title imports these from its loader by name; ours must win the bind
+    /// (HLE before the title DLL's own exports), else no call is ever seen.
+    #[test]
+    fn the_title_imports_bind_to_our_wrappers() {
+        for dll in ["amd_fidelityfx_loader_xbox.dll", "AMD_FIDELITYFX_LOADER_XBOX.DLL"] {
+            for name in ["ffxDispatch", "ffxCreateContext", "ffxQuery"] {
+                assert!(crate::registry::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
+        }
+        assert!(!crate::registry::replaces("amd_fidelityfx_loader_xbox.dll"));
+    }
 }
