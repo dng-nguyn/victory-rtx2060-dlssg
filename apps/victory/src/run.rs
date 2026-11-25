@@ -81,6 +81,11 @@ pub fn run(
             if let Some(address) = dll.export("ffxDispatch") {
                 victory_hle::modules::ffx::set_original_dispatch(address);
             }
+            for export in ["ffxCreateContext", "ffxQuery"] {
+                if let Some(address) = dll.export(export) {
+                    victory_hle::modules::ffx::set_original(export, address);
+                }
+            }
         }
     }
 

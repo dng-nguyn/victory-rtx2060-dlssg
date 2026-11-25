@@ -2,8 +2,9 @@
 //! calls to upscale its frame. Only `ffxDispatch` is ours: it records what the
 //! title hands the upscaler (its depth, motion vectors, the upscaled colour,
 //! jitter and camera) for frame generation, then calls the title's own
-//! loader. `ffxCreateContext`, `ffxConfigure`, `ffxQuery` and
-//! `ffxDestroyContext` stay the title's (the HLE registry is asked first, the
+//! loader. `ffxCreateContext` and `ffxQuery` are ours only to log what the
+//! title asks and the loader answers (then the loader's own run);
+//! `ffxConfigure` and `ffxDestroyContext` stay the title's (the HLE registry is asked first, the
 //! title's DLLs after, so only the names listed here are taken over).
 //!
 //! The structures follow AMD's published `ffx_api.h` / `ffx_upscale.h`
@@ -235,11 +236,105 @@ extern "system" fn ffxDispatch(context: *mut c_void, desc: *const Header) -> i32
     unsafe { std::mem::transmute::<usize, Dispatch>(original)(context, desc) }
 }
 
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE` (`ffx_upscale.h`).
+pub const CREATE_CONTEXT_DESC_TYPE_UPSCALE: u64 = 0x0001_0000;
+
+/// `ffxCreateContextDescUpscale`, up to its sizes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CreateUpscale {
+    pub header: Header,
+    pub flags: u32,
+    pub max_render_size: Dimensions,
+    pub max_upscale_size: Dimensions,
+}
+
+static ORIGINAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+static ORIGINAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+
+/// The title loader's own `ffxCreateContext` / `ffxQuery`, found once its DLL
+/// is mapped: ours log what the title asks and what the loader answers.
+pub fn set_original(name: &str, address: usize) {
+    match name {
+        "ffxCreateContext" => ORIGINAL_CREATE.store(address, Ordering::Release),
+        "ffxQuery" => ORIGINAL_QUERY.store(address, Ordering::Release),
+        _ => {}
+    }
+}
+
+/// The kinds of a descriptor chain, first to last (at most 8).
+///
+/// # Safety
+/// `desc` is null or the start of a chain of valid headers.
+unsafe fn kinds(mut desc: *const Header) -> Vec<u64> {
+    let mut out = Vec::new();
+    while out.len() < 8 {
+        // SAFETY: the caller's contract, one link at a time.
+        let Some(header) = (unsafe { desc.as_ref() }) else { break };
+        out.push(header.kind);
+        desc = header.next;
+    }
+    out
+}
+
+type Create = unsafe extern "system" fn(*mut c_void, *const Header, *const c_void) -> i32;
+type Query = unsafe extern "system" fn(*mut c_void, *const Header) -> i32;
+
+/// `ffxReturnCode_t ffxCreateContext(ffxContext*, ffxCreateContextDescHeader*, const ffxAllocationCallbacks*)`.
+extern "system" fn ffxCreateContext(context: *mut c_void, desc: *const Header, memory: *const c_void) -> i32 {
+    let original = ORIGINAL_CREATE.load(Ordering::Acquire);
+    if original == 0 {
+        tracing::error!("ffx: ffxCreateContext called before the title's loader was found");
+        return 1;
+    }
+    // SAFETY: the title loader's own export, with the title's arguments.
+    let r = unsafe { std::mem::transmute::<usize, Create>(original)(context, desc, memory) };
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        // SAFETY: the title passes a valid chain to its own loader.
+        let chain = unsafe { kinds(desc) };
+        let upscale = (!desc.is_null() && unsafe { (*desc).kind } == CREATE_CONTEXT_DESC_TYPE_UPSCALE)
+            // SAFETY: a header of this type starts this descriptor.
+            .then(|| unsafe { *desc.cast::<CreateUpscale>() });
+        tracing::info!(
+            result = r,
+            chain = ?chain.iter().map(|k| format!("{k:#x}")).collect::<Vec<_>>(),
+            flags = upscale.map(|u| format!("{:#x}", u.flags)),
+            max_render = upscale.map(|u| format!("{}x{}", u.max_render_size.width, u.max_render_size.height)),
+            max_upscale = upscale.map(|u| format!("{}x{}", u.max_upscale_size.width, u.max_upscale_size.height)),
+            "ffx: ffxCreateContext"
+        );
+    }
+    r
+}
+
+/// `ffxReturnCode_t ffxQuery(ffxContext*, ffxQueryDescHeader*)`.
+extern "system" fn ffxQuery(context: *mut c_void, desc: *const Header) -> i32 {
+    let original = ORIGINAL_QUERY.load(Ordering::Acquire);
+    if original == 0 {
+        tracing::error!("ffx: ffxQuery called before the title's loader was found");
+        return 1;
+    }
+    // SAFETY: the title loader's own export, with the title's arguments.
+    let r = unsafe { std::mem::transmute::<usize, Query>(original)(context, desc) };
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        // SAFETY: as above.
+        let chain = unsafe { kinds(desc) };
+        tracing::info!(
+            result = r,
+            chain = ?chain.iter().map(|k| format!("{k:#x}")).collect::<Vec<_>>(),
+            "ffx: ffxQuery"
+        );
+    }
+    r
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "ffx",
         dlls: &["amd_fidelityfx_loader_xbox.dll"],
-        exports: vec![hle_export!(ffxDispatch)],
+        exports: vec![hle_export!(ffxDispatch), hle_export!(ffxCreateContext), hle_export!(ffxQuery)],
     }
 }
 
@@ -257,6 +352,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(DispatchUpscale, color), 24);
         assert_eq!(std::mem::offset_of!(DispatchUpscale, jitter_offset), 24 + 7 * 48);
         assert_eq!(std::mem::offset_of!(DispatchUpscale, render_size), 24 + 7 * 48 + 16);
+        assert_eq!(std::mem::offset_of!(CreateUpscale, flags), 16);
+        assert_eq!(std::mem::offset_of!(CreateUpscale, max_render_size), 20);
+        assert_eq!(std::mem::offset_of!(CreateUpscale, max_upscale_size), 28);
     }
 
     #[test]
