@@ -243,8 +243,8 @@ extern "system" fn modes(
     }
     *count = 1;
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width: display_size().0,
+        height: display_size().1,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -254,6 +254,26 @@ extern "system" fn modes(
     // SAFETY: checked non-null; room for `count` >= 1 modes.
     unsafe { out.write(mode) };
     S_OK
+}
+
+/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
+/// if set (as a console reports the television it is plugged into: a
+/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// (Ported from fxceless/victory-fork.)
+fn display_size() -> (u32, u32) {
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        });
+        let size = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            _ => (3840, 2160),
+        };
+        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        size
+    })
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
