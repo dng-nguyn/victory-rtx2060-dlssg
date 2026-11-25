@@ -2184,13 +2184,25 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    // (Title memory can hold anything: a texture view's union read as a
+    // buffer's, or counts whose product wraps, named memory that is not the
+    // view's. Upstream #2541.)
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
+    // SAFETY: `ViewDimension` is `D3D12_SRV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+/// The (start, bytes) of `count` elements of `element` bytes from element
+/// `first` of memory at `base`; `None` where any of it overflows.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    start.checked_add(bytes)?;
+    Some((start, bytes))
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -2262,7 +2274,10 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
@@ -2271,10 +2286,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -3197,6 +3209,15 @@ mod tests {
         assert_eq!(constant_view_size(65_537), 65_536);
         assert_eq!(constant_view_size(u32::MAX), 65_536);
         assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
+
+    #[test]
+    fn overflowing_buffer_ranges_are_refused() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 4, 16), Some((0x1020, 64)));
+        // `(1 << 60) * 16` wraps to 0 unchecked.
+        assert_eq!(checked_buffer_range(0x1000, 1 << 60, 4, 16), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, 4, 16), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 1, 0, 16), None);
     }
 
     #[test]
