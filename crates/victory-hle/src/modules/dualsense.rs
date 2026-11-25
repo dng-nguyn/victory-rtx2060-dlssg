@@ -287,8 +287,11 @@ fn device_paths() -> Vec<Vec<u16>> {
         while unsafe { *path.add(len) } != 0 {
             len += 1;
         }
-        // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
+        // SAFETY: `path` is valid for `len` u16s and its NUL in the live
+        // buffer. The NUL is kept: `CreateFileW` reads up to it, and without
+        // it read past the copy's end (an access violation when the copy
+        // ended at a page's end, seen on a machine with many HID devices).
+        paths.push(unsafe { std::slice::from_raw_parts(path, len + 1) }.to_vec());
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
@@ -480,6 +483,15 @@ mod tests {
 
     /// Not part of the suite: prints what the HID scan sees on this machine.
     /// `cargo test -p victory-hle --lib dualsense -- --ignored --nocapture`
+    /// Paths go to `CreateFileW` as they are, so each ends in its NUL.
+    #[test]
+    fn hid_paths_end_in_nul() {
+        for path in device_paths() {
+            assert_eq!(path.last(), Some(&0), "{}", String::from_utf16_lossy(&path));
+            assert!(!path[..path.len() - 1].contains(&0));
+        }
+    }
+
     #[test]
     #[ignore]
     fn lists_and_opens_hid_devices() {
