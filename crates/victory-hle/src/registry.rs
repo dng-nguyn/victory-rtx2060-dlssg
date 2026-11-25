@@ -53,6 +53,16 @@ pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }
 
+/// Modules that take over a few exports of a title DLL and call the rest
+/// through it: the title's own DLL is still loaded for them.
+const WRAPPERS: &[&str] = &["ffx"];
+
+/// Whether `dll` is replaced by our modules (the title's own copy is then
+/// not loaded); a DLL only wrapped (`WRAPPERS`) is still loaded.
+pub fn replaces(dll: &str) -> bool {
+    registry().iter().any(|m| m.serves(dll) && !WRAPPERS.contains(&m.name))
+}
+
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     registry()
         .iter()

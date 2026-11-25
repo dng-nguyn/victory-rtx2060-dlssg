@@ -893,10 +893,15 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        // Through Streamline's proxy device when frame generation is on
+        // (`crate::dlssg`): the swap chain presents on this queue.
+        let queue: ID3D12CommandQueue = crate::dlssg::create_queue(
+            &device,
+            &D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            },
+        )?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -8969,6 +8974,7 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            crate::dlssg::frame_begin();
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -8997,6 +9003,8 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // Frame generation's inputs, copied by Streamline on this list.
+            crate::dlssg::frame_inputs(list, (width, height));
             copy.close();
             match slot {
                 Some(i) => {
@@ -9012,7 +9020,9 @@ impl Host {
             // What Present answers was thrown away: a removal it is the
             // first to report then looked as if the next call found it.
             // Said once (a status that is no error, as "occluded", is not).
+            crate::dlssg::present_start();
             let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::dlssg::present_end();
             if shown.is_err() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
@@ -9041,6 +9051,9 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            // Streamline's proxy factory with frame generation on: the swap
+            // chain it makes is one DLSS-G presents through.
+            let factory = crate::dlssg::upgrade(factory);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9060,6 +9073,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            crate::dlssg::swap_chain_ready(&self.device, width, height);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,

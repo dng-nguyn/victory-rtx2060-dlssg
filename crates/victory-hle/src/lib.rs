@@ -17,7 +17,7 @@ mod registry;
 pub mod runtime;
 
 pub use host::HostPolicy;
-pub use registry::{HleExport, HleModule, registry};
+pub use registry::{HleExport, HleModule, registry, replaces};
 pub use victory_gpu::console;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};

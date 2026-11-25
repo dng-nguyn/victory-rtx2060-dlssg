@@ -1405,6 +1405,20 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// The host copy of title texture `this` and the host state it is in now,
+/// if it has one (frame generation reads the title's depth and motion
+/// vectors at present time; this does not count as a use).
+#[cfg(windows)]
+pub(crate) fn host_texture_now(
+    this: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, false)?;
+    Some((host.texture.clone(), host.state.load(std::sync::atomic::Ordering::Acquire)))
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use

@@ -17,6 +17,7 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod ffx;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -53,6 +54,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         audio::module(),
         dsp::module(),
         xg::module(),
+        ffx::module(),
     ];
     #[cfg(windows)]
     all.push(apu::module());

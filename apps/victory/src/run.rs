@@ -75,6 +75,13 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        // Frame generation reads what the title hands its upscaler: our
+        // `ffxDispatch` records it and calls this, the loader's own.
+        if name.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll") {
+            if let Some(address) = dll.export("ffxDispatch") {
+                victory_hle::modules::ffx::set_original_dispatch(address);
+            }
+        }
     }
 
     let policy = match unimplemented {
@@ -215,7 +222,7 @@ fn watch(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    !host.allows(dll) && !victory_hle::replaces(dll)
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
