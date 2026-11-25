@@ -4277,6 +4277,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a quad-local read must reach helper lanes: in a pixel program
+    /// every quad a triangle edge crosses has some (the console's whole-quad
+    /// mode runs them; discarded pixels stay helpers too), and only quad
+    /// reads see them on the host. Wave reads leave helpers out, and on AMD
+    /// a read of one gives 0: wrong derivatives of computed values along
+    /// every triangle edge (WARP and NVIDIA happen to include them).
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4399,6 +4409,7 @@ impl<'a> Lower<'a> {
             if !mesh_quad {
                 self.cross_lane(quad)?;
             }
+            let quad_read = mesh_quad || self.helpers_read(quad);
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
             let lane = self.lane_index();
@@ -4421,7 +4432,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if quad_read {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6710,6 +6721,7 @@ impl<'a> Lower<'a> {
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
+        let quad_read = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
         let lane = self.lane_index();
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
@@ -6785,7 +6797,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if quad_read {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
