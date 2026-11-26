@@ -129,15 +129,29 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Host `(available physical RAM, available commit charge)` in bytes, from
+/// `GlobalMemoryStatusEx`.
+fn memory_status() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|(phys, _)| phys)
+}
+
+/// What staging and shadow buffers may use: the lower of available physical
+/// RAM and commit headroom, since both run out (fxceless #822; on the
+/// RTX 2060 PC the commit charge stood at 40.5 of 41.4 GB with 5 GB of RAM
+/// free, 2026-11-26).
+pub(crate) fn available_cache_ram() -> Option<u64> {
+    memory_status().map(|(phys, commit)| phys.min(commit))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
