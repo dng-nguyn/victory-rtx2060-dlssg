@@ -1,0 +1,1370 @@
+From 321897fbfa7dc0e947090ad49fecc31030b08e91 Mon Sep 17 00:00:00 2001
+From: dng-nguyn <dungnguyen@dinhcap.dev>
+Date: Thu, 26 Nov 2026 12:16:12 +0700
+Subject: [PATCH 1/2] victory: DLSS Frame Generation through Streamline (ported
+ from rtx2060-full)
+
+FidelityFX capture wrapper, depth/motion-vector scout from the title's render
+targets, C++ Streamline bridge (manual hooking, frame-based tagging). Off unless
+VICTORY_DLSSG=1..5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ third_party/victory/apps/victory/src/run.rs   |  14 +-
+ .../victory/crates/victory-gpu/src/dlssg.rs   | 425 ++++++++++++++++++
+ .../victory/crates/victory-gpu/src/draw.rs    |   8 +
+ .../victory/crates/victory-gpu/src/host.rs    |  19 +-
+ .../victory/crates/victory-gpu/src/lib.rs     |   2 +
+ .../crates/victory-gpu/src/resource.rs        |  14 +
+ .../victory/crates/victory-hle/src/lib.rs     |   2 +-
+ .../crates/victory-hle/src/modules/ffx.rs     | 384 ++++++++++++++++
+ .../crates/victory-hle/src/modules/mod.rs     |   2 +
+ .../crates/victory-hle/src/registry.rs        |  10 +
+ .../victory/native/victory_sl/build.bat       |   9 +
+ .../victory/native/victory_sl/victory_sl.cpp  | 289 ++++++++++++
+ 12 files changed, 1172 insertions(+), 6 deletions(-)
+ create mode 100644 third_party/victory/crates/victory-gpu/src/dlssg.rs
+ create mode 100644 third_party/victory/crates/victory-hle/src/modules/ffx.rs
+ create mode 100644 third_party/victory/native/victory_sl/build.bat
+ create mode 100644 third_party/victory/native/victory_sl/victory_sl.cpp
+
+diff --git a/third_party/victory/apps/victory/src/run.rs b/third_party/victory/apps/victory/src/run.rs
+index 9b1032c..d51fea6 100644
+--- a/third_party/victory/apps/victory/src/run.rs
++++ b/third_party/victory/apps/victory/src/run.rs
+@@ -82,6 +82,18 @@ pub fn run(
+     for (name, dll) in &dlls {
+         println!("title dll      {name} at {:#x}", dll.base());
+         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
++        // Frame generation reads what the title hands its upscaler: our
++        // `ffxDispatch` records it and calls this, the loader's own.
++        if name.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll") {
++            if let Some(address) = dll.export("ffxDispatch") {
++                victory_hle::modules::ffx::set_original_dispatch(address);
++            }
++            for export in ["ffxCreateContext", "ffxQuery"] {
++                if let Some(address) = dll.export(export) {
++                    victory_hle::modules::ffx::set_original(export, address);
++                }
++            }
++        }
+         victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
+     }
+ 
+@@ -196,7 +208,7 @@ fn watch(base: usize, size: usize) {
+ /// DLLs the host or our runtime provide are never taken from the title.
+ #[cfg(windows)]
+ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
++    !host.allows(dll) && !victory_hle::replaces(dll)
+ }
+ 
+ /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
+diff --git a/third_party/victory/crates/victory-gpu/src/dlssg.rs b/third_party/victory/crates/victory-gpu/src/dlssg.rs
+new file mode 100644
+index 0000000..9082fef
+--- /dev/null
++++ b/third_party/victory/crates/victory-gpu/src/dlssg.rs
+@@ -0,0 +1,425 @@
++//! DLSS Frame Generation on VIctory's swap chain, through NVIDIA Streamline
++//! (`VICTORY_DLSSG=<frames generated per real frame>`, 1 to 5; off by
++//! default). The Streamline calls live in a small C++ bridge,
++//! `victory_sl.dll` (`native/victory_sl`), loaded only when this is on, from
++//! `VICTORY_SL_DIR` (default: beside our executable), which also holds
++//! Streamline's own DLLs and `nvngx_dlssg.dll`.
++//!
++//! The inputs are what the title hands AMD's upscaler each frame
++//! (`victory_hle::modules::ffx` records them through [`record`]): its depth
++//! and motion vectors (title textures, read through their host copies at
++//! present time), jitter, motion vector scale and camera. With manual
++//! hooking our queue is made through Streamline's proxy device and the swap
++//! chain through its proxy factory; DLSS-G then paces the frames itself.
++//!
++//! NVIDIA's runtime runs DLSS-G on RTX 40/50 cards; on others it reports it
++//! unsupported unless something else (a third-party unlocker loaded into the
++//! process) makes it run. Either way this logs what Streamline says.
++
++use std::ffi::c_void;
++use std::sync::Mutex;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use windows::Win32::Foundation::HMODULE;
++use windows::Win32::Graphics::Direct3D12::{D3D12_COMMAND_QUEUE_DESC, ID3D12CommandQueue, ID3D12Device};
++use windows::Win32::System::LibraryLoader::{
++    GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
++};
++use windows::core::{Interface, PCSTR, PCWSTR};
++
++/// What the title last handed its upscaler (title objects as addresses).
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Inputs {
++    pub depth: usize,
++    pub depth_state: u32,
++    pub motion_vectors: usize,
++    pub motion_state: u32,
++    pub render: (u32, u32),
++    pub upscale: (u32, u32),
++    pub jitter: (f32, f32),
++    pub motion_vector_scale: (f32, f32),
++    pub near: f32,
++    pub far: f32,
++    pub fov_y: f32,
++    pub reset: bool,
++}
++
++static INPUTS: Mutex<Option<Inputs>> = Mutex::new(None);
++static RECORDED: AtomicU64 = AtomicU64::new(0);
++
++/// Called for each upscale dispatch of the title.
++pub fn record(inputs: Inputs) {
++    RECORDED.fetch_add(1, Ordering::Relaxed);
++    *INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(inputs);
++}
++
++/// The render targets and depth buffers the title binds, by title object,
++/// counted over the frame (`VICTORY_DLSSG` on only). The title does not hand
++/// its depth and motion vectors to an upscaler in every mode, so frame
++/// generation picks them from what it draws into: the main depth buffer is
++/// the largest, most used one; the motion vectors a two-channel 16-bit
++/// target of the same size.
++#[derive(Default)]
++struct Scout {
++    colors: std::collections::HashMap<usize, (i32, u32)>, // (view format, binds)
++    depths: std::collections::HashMap<usize, u32>,       // binds
++}
++
++static SCOUT: Mutex<Option<Scout>> = Mutex::new(None);
++
++/// Whether binds are counted (frame generation on).
++pub(crate) fn scouting() -> bool {
++    frames() > 0
++}
++
++/// One `OMSetRenderTargets` of the title: its targets (object, view format)
++/// and depth buffer (0 if none).
++pub(crate) fn note_targets(colors: &[(usize, i32)], depth: usize) {
++    let mut g = SCOUT.lock().unwrap_or_else(|e| e.into_inner());
++    let s = g.get_or_insert_with(Scout::default);
++    for &(c, format) in colors {
++        let e = s.colors.entry(c).or_insert((format, 0));
++        e.0 = format;
++        e.1 += 1;
++    }
++    if depth != 0 {
++        *s.depths.entry(depth).or_insert(0) += 1;
++    }
++}
++
++fn size_of_texture(t: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> (u32, u32) {
++    // SAFETY: a live resource.
++    let d = unsafe { t.GetDesc() };
++    (d.Width as u32, d.Height)
++}
++
++/// `R16G16_FLOAT`, `R16G16_UNORM`, `R16G16_SNORM`, `R16G16_SINT` and
++/// `R32G32_FLOAT`: what motion vectors are drawn into.
++fn motion_format(format: i32) -> bool {
++    matches!(format, 34 | 35 | 37 | 38 | 16)
++}
++
++/// A float from `VICTORY_DLSSG_<name>`, else `default`.
++fn knob(name: &str, default: f32) -> f32 {
++    std::env::var(format!("VICTORY_DLSSG_{name}")).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
++}
++
++/// The frame's picks, from the binds counted since the last present (which
++/// are then cleared): `None` while nothing fits.
++fn scouted(output: (u32, u32)) -> Option<Inputs> {
++    let taken = SCOUT.lock().unwrap_or_else(|e| e.into_inner()).take()?;
++    // The main depth: the largest area, then the most binds.
++    let mut depth: Option<(usize, (u32, u32), u32)> = None;
++    for (&d, &binds) in &taken.depths {
++        let Some((t, _)) = crate::resource::host_texture_now(d as crate::object::This) else { continue };
++        let size = size_of_texture(&t);
++        let better = depth.is_none_or(|(_, s, b)| (size.0 * size.1, binds) > (s.0 * s.1, b));
++        if better {
++            depth = Some((d, size, binds));
++        }
++    }
++    let (depth, size, depth_binds) = depth?;
++    // The motion vectors: a two-channel 16-bit target of the depth's size,
++    // the most bound.
++    let mut mvec: Option<(usize, i32, u32)> = None;
++    for (&c, &(format, binds)) in &taken.colors {
++        if !motion_format(format) {
++            continue;
++        }
++        let Some((t, _)) = crate::resource::host_texture_now(c as crate::object::This) else { continue };
++        if size_of_texture(&t) != size {
++            continue;
++        }
++        if mvec.is_none_or(|(_, _, b)| binds > b) {
++            mvec = Some((c, format, binds));
++        }
++    }
++    static PICKS: AtomicU64 = AtomicU64::new(0);
++    let n = PICKS.fetch_add(1, Ordering::Relaxed);
++    if n < 4 || n.is_power_of_two() {
++        let colors: Vec<String> = taken
++            .colors
++            .iter()
++            .filter(|(_, (f, _))| motion_format(*f))
++            .map(|(c, (f, b))| format!("{c:#x}:fmt{f}x{b}"))
++            .collect();
++        tracing::info!(
++            depth = format_args!("{depth:#x}"),
++            size = format_args!("{}x{}", size.0, size.1),
++            depth_binds,
++            depths = taken.depths.len(),
++            mvec = ?mvec.map(|(c, f, b)| format!("{c:#x} fmt {f} x{b}")),
++            two_channel_targets = ?colors,
++            output = format_args!("{}x{}", output.0, output.1),
++            "dlssg: scouted the title's depth and motion vectors"
++        );
++    }
++    let (mvec, _, _) = mvec?;
++    // What the title's own data does not say: settable, logged above.
++    let fov = knob("FOV_DEG", 60.0).to_radians();
++    let inverted = knob("DEPTH_INVERTED", 1.0) != 0.0;
++    let (near, far) = (knob("NEAR", 0.1), knob("FAR", 10000.0));
++    Some(Inputs {
++        depth,
++        depth_state: 0,
++        motion_vectors: mvec,
++        motion_state: 0,
++        render: size,
++        upscale: output,
++        jitter: (0.0, 0.0),
++        // Multiplied by the render size below (`frame_inputs` divides by it):
++        // MVEC_SCALE is what SL wants, e.g. 1 for vectors in UV units.
++        motion_vector_scale: (knob("MVEC_SCALE_X", 1.0) * size.0 as f32, knob("MVEC_SCALE_Y", 1.0) * size.1 as f32),
++        near: if inverted { far } else { near },
++        far: if inverted { near } else { far },
++        fov_y: fov,
++        reset: n == 0,
++    })
++}
++
++/// Frames to generate per real one, 0 if off.
++pub fn frames() -> u32 {
++    static N: OnceLock<u32> = OnceLock::new();
++    *N.get_or_init(|| {
++        std::env::var("VICTORY_DLSSG").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(5)
++    })
++}
++
++/// `VslFrame` of the bridge.
++#[repr(C)]
++struct Frame {
++    depth: *mut c_void,
++    depth_state: u32,
++    mvec: *mut c_void,
++    mvec_state: u32,
++    render_width: u32,
++    render_height: u32,
++    output_width: u32,
++    output_height: u32,
++    jitter_x: f32,
++    jitter_y: f32,
++    mvec_scale_x: f32,
++    mvec_scale_y: f32,
++    near_z: f32,
++    far_z: f32,
++    fov_y: f32,
++    depth_inverted: i32,
++    reset: i32,
++}
++
++struct Bridge {
++    init: unsafe extern "C" fn(PCWSTR, PCWSTR) -> i32,
++    set_device: unsafe extern "C" fn(*mut c_void) -> i32,
++    create_queue: unsafe extern "C" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *mut *mut c_void) -> i32,
++    upgrade: unsafe extern "C" fn(*mut *mut c_void) -> i32,
++    check: unsafe extern "C" fn(u32, i32, *mut i32) -> i32,
++    set_options: unsafe extern "C" fn(i32, u32, u32) -> i32,
++    reflex_on: unsafe extern "C" fn() -> i32,
++    frame_begin: unsafe extern "C" fn() -> i32,
++    frame_inputs: unsafe extern "C" fn(*mut c_void, *const Frame) -> i32,
++    present_start: unsafe extern "C" fn(),
++    present_end: unsafe extern "C" fn(),
++}
++
++// SAFETY: plain function pointers into a DLL that stays loaded.
++unsafe impl Send for Bridge {}
++unsafe impl Sync for Bridge {}
++
++fn dir() -> std::path::PathBuf {
++    std::env::var_os("VICTORY_SL_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
++        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default()
++    })
++}
++
++fn wide(s: &std::path::Path) -> Vec<u16> {
++    use std::os::windows::ffi::OsStrExt;
++    s.as_os_str().encode_wide().chain([0]).collect()
++}
++
++/// The bridge, loaded and initialised once; `None` if off or it failed.
++fn bridge() -> Option<&'static Bridge> {
++    static BRIDGE: OnceLock<Option<Bridge>> = OnceLock::new();
++    BRIDGE
++        .get_or_init(|| {
++            if frames() == 0 {
++                return None;
++            }
++            let dir = dir();
++            let path = wide(&dir.join("victory_sl.dll"));
++            // SAFETY: a full path; the bridge's own DLLs are found beside it.
++            let module: HMODULE = match unsafe { LoadLibraryExW(PCWSTR(path.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) } {
++                Ok(m) => m,
++                Err(e) => {
++                    tracing::warn!(dir = %dir.display(), error = %e, "dlssg: victory_sl.dll did not load; frame generation off");
++                    return None;
++                }
++            };
++            macro_rules! f {
++                ($name:literal) => {{
++                    // SAFETY: a name the bridge exports, as a C string.
++                    let p = unsafe { GetProcAddress(module, PCSTR(concat!($name, "\0").as_ptr())) };
++                    match p {
++                        // SAFETY: the bridge's export has this signature.
++                        Some(p) => unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(p) },
++                        None => {
++                            tracing::warn!(name = $name, "dlssg: bridge export missing");
++                            return None;
++                        }
++                    }
++                }};
++            }
++            let b = Bridge {
++                init: f!("vsl_init"),
++                set_device: f!("vsl_set_device"),
++                create_queue: f!("vsl_create_queue"),
++                upgrade: f!("vsl_upgrade"),
++                check: f!("vsl_check"),
++                set_options: f!("vsl_set_options"),
++                reflex_on: f!("vsl_reflex_on"),
++                frame_begin: f!("vsl_frame_begin"),
++                frame_inputs: f!("vsl_frame_inputs"),
++                present_start: f!("vsl_present_start"),
++                present_end: f!("vsl_present_end"),
++            };
++            let plugins = wide(&dir);
++            let log = std::env::var_os("VICTORY_SL_LOG").map(std::path::PathBuf::from).map(|p| wide(&p));
++            // SAFETY: NUL-terminated wide strings that live through the call.
++            let r = unsafe { (b.init)(PCWSTR(plugins.as_ptr()), log.as_ref().map_or(PCWSTR::null(), |l| PCWSTR(l.as_ptr()))) };
++            if r != 0 {
++                tracing::warn!(result = r, "dlssg: slInit failed; frame generation off");
++                return None;
++            }
++            tracing::info!(frames = frames(), dir = %dir.display(), "dlssg: Streamline is up");
++            Some(b)
++        })
++        .as_ref()
++}
++
++/// Makes the host's direct queue, through Streamline when frame generation
++/// is on (its proxy device must make the queue the swap chain presents on).
++pub(crate) fn create_queue(device: &ID3D12Device, desc: &D3D12_COMMAND_QUEUE_DESC) -> windows::core::Result<ID3D12CommandQueue> {
++    if let Some(b) = bridge() {
++        // SAFETY: our live device.
++        let set = unsafe { (b.set_device)(device.as_raw()) };
++        let mut queue: *mut c_void = std::ptr::null_mut();
++        // SAFETY: our device and description; `queue` receives a reference.
++        let r = unsafe { (b.create_queue)(device.as_raw(), desc, &mut queue) };
++        if set == 0 && r == 0 && !queue.is_null() {
++            tracing::info!("dlssg: the host queue is made through Streamline");
++            // SAFETY: a queue the call made, whose reference we now own.
++            return Ok(unsafe { ID3D12CommandQueue::from_raw(queue) });
++        }
++        tracing::warn!(set, result = r, "dlssg: the queue could not be made through Streamline; a native one is used");
++    }
++    // SAFETY: plain creation.
++    unsafe { device.CreateCommandQueue(desc) }
++}
++
++/// Replaces a DXGI factory by Streamline's proxy, so the swap chain made
++/// from it is one DLSS-G drives.
++pub(crate) fn upgrade<T: Interface>(object: T) -> T {
++    let Some(b) = bridge() else { return object };
++    let mut raw = object.into_raw();
++    // SAFETY: `raw` holds our reference; the call swaps it for the proxy's.
++    let r = unsafe { (b.upgrade)(&mut raw) };
++    if r != 0 {
++        tracing::warn!(result = r, "dlssg: slUpgradeInterface failed");
++    }
++    // SAFETY: whichever object `raw` now names, we own one reference to it.
++    unsafe { T::from_raw(raw) }
++}
++
++/// After the swap chain is made: asks Streamline whether DLSS-G may run here
++/// and turns it on.
++pub(crate) fn swap_chain_ready(device: &ID3D12Device, width: u32, height: u32) {
++    let Some(b) = bridge() else { return };
++    // SAFETY: plain query.
++    let luid = unsafe { device.GetAdapterLuid() };
++    let mut max = 0;
++    // SAFETY: plain calls into the bridge.
++    let supported = unsafe { (b.check)(luid.LowPart, luid.HighPart, &mut max) };
++    // SAFETY: as above.
++    let reflex = unsafe { (b.reflex_on)() };
++    let wanted = frames().min(if max > 0 { max as u32 } else { frames() });
++    // SAFETY: as above.
++    let set = unsafe { (b.set_options)(wanted as i32, width, height) };
++    tracing::info!(supported, max_generated = max, reflex, set, frames = wanted, "dlssg: frame generation asked for");
++}
++
++/// The start of a frame's present (before its copy is recorded).
++pub(crate) fn frame_begin() {
++    if let Some(b) = bridge() {
++        // SAFETY: plain call.
++        unsafe { (b.frame_begin)() };
++    }
++}
++
++/// Tags the title's depth and motion vectors and sets the camera constants,
++/// recorded on `list` (Streamline copies the tagged textures there).
++pub(crate) fn frame_inputs(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, output: (u32, u32)) {
++    let Some(b) = bridge() else { return };
++    // The upscaler's inputs if the title gave any, else the scouted ones.
++    let recorded = *INPUTS.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(i) = recorded.or_else(|| scouted(output)) else {
++        return;
++    };
++    let depth = crate::resource::host_texture_now(i.depth as crate::object::This);
++    let mvec = crate::resource::host_texture_now(i.motion_vectors as crate::object::This);
++    let (Some((depth, depth_state)), Some((mvec, mvec_state))) = (depth, mvec) else {
++        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++        if !ONCE.swap(true, Ordering::Relaxed) {
++            tracing::warn!("dlssg: the title's depth or motion vectors have no host copy yet");
++        }
++        return;
++    };
++    // The title names its upscaler's states; the host copies say theirs.
++    let _ = (i.depth_state, i.motion_state);
++    let f = Frame {
++        depth: depth.as_raw(),
++        depth_state,
++        mvec: mvec.as_raw(),
++        mvec_state,
++        render_width: i.render.0,
++        render_height: i.render.1,
++        output_width: output.0,
++        output_height: output.1,
++        jitter_x: i.jitter.0,
++        jitter_y: i.jitter.1,
++        // FSR's scale takes vectors to render pixels; SL wants [-1, 1].
++        mvec_scale_x: if i.render.0 > 0 { i.motion_vector_scale.0 / i.render.0 as f32 } else { 1.0 },
++        mvec_scale_y: if i.render.1 > 0 { i.motion_vector_scale.1 / i.render.1 as f32 } else { 1.0 },
++        near_z: i.near,
++        far_z: i.far,
++        fov_y: i.fov_y,
++        // Reversed depth when the title's near plane is beyond its far one.
++        depth_inverted: i32::from(i.near > i.far),
++        reset: i32::from(i.reset),
++    };
++    // SAFETY: our open list, live resources that outlive the call.
++    let r = unsafe { (b.frame_inputs)(list.as_raw(), &f) };
++    static LOGGED: AtomicU64 = AtomicU64::new(0);
++    let n = LOGGED.fetch_add(1, Ordering::Relaxed);
++    if n < 3 || r != 0 && n.is_power_of_two() {
++        tracing::info!(result = r, depth_state, mvec_state, ?i, "dlssg: frame inputs tagged");
++    }
++}
++
++pub(crate) fn present_start() {
++    if let Some(b) = bridge() {
++        // SAFETY: plain call.
++        unsafe { (b.present_start)() };
++    }
++}
++
++pub(crate) fn present_end() {
++    if let Some(b) = bridge() {
++        // SAFETY: plain call.
++        unsafe { (b.present_end)() };
++    }
++}
++
++/// Whether frame generation is on and its bridge loaded.
++pub(crate) fn active() -> bool {
++    bridge().is_some()
++}
+diff --git a/third_party/victory/crates/victory-gpu/src/draw.rs b/third_party/victory/crates/victory-gpu/src/draw.rs
+index 52aff49..c4d3496 100644
+--- a/third_party/victory/crates/victory-gpu/src/draw.rs
++++ b/third_party/victory/crates/victory-gpu/src/draw.rs
+@@ -722,6 +722,14 @@ impl State {
+             crate::capture::note_target(record.resource);
+             Some(host.dsv(texture, record.depth_desc().as_ref()))
+         });
++        if crate::dlssg::scouting() {
++            let colors: Vec<(usize, i32)> = handles
++                .iter()
++                .filter_map(|&h| crate::descriptor::rtv_record(h))
++                .map(|r| (r.resource as usize, r.desc().map_or(0, |d| d.Format.0)))
++                .collect();
++            crate::dlssg::note_targets(&colors, self.depth);
++        }
+         // SAFETY: an open list; the views were just made.
+         unsafe {
+             list.list.OMSetRenderTargets(
+diff --git a/third_party/victory/crates/victory-gpu/src/host.rs b/third_party/victory/crates/victory-gpu/src/host.rs
+index 011407c..c3f6790 100644
+--- a/third_party/victory/crates/victory-gpu/src/host.rs
++++ b/third_party/victory/crates/victory-gpu/src/host.rs
+@@ -728,10 +728,13 @@ fn create() -> windows::core::Result<Host> {
+         let messages = debug
+             .then(|| device.cast::<ID3D12InfoQueue>().ok())
+             .flatten();
+-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+-            ..Default::default()
+-        })?;
++        let queue: ID3D12CommandQueue = crate::dlssg::create_queue(
++            &device,
++            &D3D12_COMMAND_QUEUE_DESC {
++                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
++                ..Default::default()
++            },
++        )?;
+         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+         let event = CreateEventW(None, false, false, None)?;
+         let rtvs: ID3D12DescriptorHeap =
+@@ -8671,6 +8674,7 @@ impl Host {
+             };
+             copy.reset();
+             let list = &copy.list;
++            crate::dlssg::frame_begin();
+             list.ResourceBarrier(&[
+                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                 transition(
+@@ -8701,6 +8705,8 @@ impl Host {
+                     D3D12_RESOURCE_STATE_PRESENT,
+                 ),
+             ]);
++            // Frame generation's inputs, copied by Streamline on this list.
++            crate::dlssg::frame_inputs(list, (width, height));
+             copy.close();
+             match slot {
+                 Some(i) => {
+@@ -8716,7 +8722,9 @@ impl Host {
+             if let Some((buffer, footprint)) = capture {
+                 crate::capture::save_read_back(frame, &buffer, &footprint);
+             }
++            crate::dlssg::present_start();
+             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            crate::dlssg::present_end();
+             p.meter.frame(p.hwnd);
+             #[cfg(feature = "diagnostics")]
+             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+@@ -8829,6 +8837,8 @@ impl Host {
+         // SAFETY: plain object creation for our window.
+         unsafe {
+             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
++            // Streamline's proxy factory with frame generation on.
++            let factory = crate::dlssg::upgrade(factory);
+             let desc = DXGI_SWAP_CHAIN_DESC1 {
+                 Width: width,
+                 Height: height,
+@@ -8848,6 +8858,7 @@ impl Host {
+             let copy = self.new_list()?;
+             copy.close();
+             tracing::info!(width, height, format = format.0, "presenting to a window");
++            crate::dlssg::swap_chain_ready(&self.device, width, height);
+             crate::overlay::start(hwnd, self.adapter.clone());
+             self.log_video_memory("right after the swap chain is made");
+             Ok(Presenter {
+diff --git a/third_party/victory/crates/victory-gpu/src/lib.rs b/third_party/victory/crates/victory-gpu/src/lib.rs
+index c8a4c6e..2dcad2f 100644
+--- a/third_party/victory/crates/victory-gpu/src/lib.rs
++++ b/third_party/victory/crates/victory-gpu/src/lib.rs
+@@ -26,6 +26,8 @@ pub mod device;
+ mod ambient;
+ #[cfg(windows)]
+ mod draw;
++#[cfg(windows)]
++pub mod dlssg;
+ pub mod dxgi;
+ #[cfg(windows)]
+ pub mod external;
+diff --git a/third_party/victory/crates/victory-gpu/src/resource.rs b/third_party/victory/crates/victory-gpu/src/resource.rs
+index c5a1f59..f06f64e 100644
+--- a/third_party/victory/crates/victory-gpu/src/resource.rs
++++ b/third_party/victory/crates/victory-gpu/src/resource.rs
+@@ -4510,3 +4510,17 @@ float4 lit() : SV_Target { return 1.0; }
+         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+     }
+ }
++
++/// The host copy of title texture `this` and the host state it is in now,
++/// if it has one (frame generation reads the title's depth and motion
++/// vectors at present time; this does not count as a use).
++#[cfg(windows)]
++pub(crate) fn host_texture_now(
++    this: This,
++) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
++    if this.is_null() {
++        return None;
++    }
++    let (host, _) = hosted(this, false)?;
++    Some((host.texture.clone(), host.state.load(std::sync::atomic::Ordering::Acquire)))
++}
+diff --git a/third_party/victory/crates/victory-hle/src/lib.rs b/third_party/victory/crates/victory-hle/src/lib.rs
+index 8ffea49..fd32476 100644
+--- a/third_party/victory/crates/victory-hle/src/lib.rs
++++ b/third_party/victory/crates/victory-hle/src/lib.rs
+@@ -17,7 +17,7 @@ mod registry;
+ pub mod runtime;
+ 
+ pub use host::HostPolicy;
+-pub use registry::{HleExport, HleModule, registry};
++pub use registry::{HleExport, HleModule, registry, replaces};
+ pub use victory_gpu::console;
+ 
+ use victory_loader::{ImportResolver, Provenance, Resolution};
+diff --git a/third_party/victory/crates/victory-hle/src/modules/ffx.rs b/third_party/victory/crates/victory-hle/src/modules/ffx.rs
+new file mode 100644
+index 0000000..1e3d9d3
+--- /dev/null
++++ b/third_party/victory/crates/victory-hle/src/modules/ffx.rs
+@@ -0,0 +1,384 @@
++//! `amd_fidelityfx_loader_xbox.dll`: AMD's FidelityFX API, which the title
++//! calls to upscale its frame. Only `ffxDispatch` is ours: it records what the
++//! title hands the upscaler (its depth, motion vectors, the upscaled colour,
++//! jitter and camera) for frame generation, then calls the title's own
++//! loader. `ffxCreateContext` and `ffxQuery` are ours only to log what the
++//! title asks and the loader answers (then the loader's own run);
++//! `ffxConfigure` and `ffxDestroyContext` stay the title's (the HLE registry is asked first, the
++//! title's DLLs after, so only the names listed here are taken over).
++//!
++//! The structures follow AMD's published `ffx_api.h` / `ffx_upscale.h`
++//! (FidelityFX SDK 1.1). Each descriptor starts with a header (`type`, `next`)
++//! and the title chains them; the upscale dispatch is the one with type
++//! `DISPATCH_DESC_TYPE_UPSCALE`. The layout is checked at run time: the first
++//! dispatches are logged with every size, so a wrong offset shows at once.
++#![allow(non_snake_case)]
++#![allow(clippy::not_unsafe_ptr_arg_deref)]
++
++use std::ffi::c_void;
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++
++use crate::{HleModule, hle_export};
++
++/// `ffxApiHeader`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct Header {
++    pub kind: u64,
++    pub next: *const Header,
++}
++
++/// `FfxApiResourceDescription`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ResourceDescription {
++    pub kind: u32,
++    pub format: u32,
++    pub width: u32,
++    pub height: u32,
++    pub depth: u32,
++    pub mip_count: u32,
++    pub flags: u32,
++    pub usage: u32,
++}
++
++/// `FfxApiResource`: the title's `ID3D12Resource` (a D3D12.X object), its
++/// description and its state.
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct Resource {
++    pub resource: *mut c_void,
++    pub description: ResourceDescription,
++    pub state: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct Float2 {
++    pub x: f32,
++    pub y: f32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Dimensions {
++    pub width: u32,
++    pub height: u32,
++}
++
++/// `ffxDispatchDescUpscale`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct DispatchUpscale {
++    pub header: Header,
++    pub command_list: *mut c_void,
++    pub color: Resource,
++    pub depth: Resource,
++    pub motion_vectors: Resource,
++    pub exposure: Resource,
++    pub reactive: Resource,
++    pub transparency_and_composition: Resource,
++    pub output: Resource,
++    pub jitter_offset: Float2,
++    pub motion_vector_scale: Float2,
++    pub render_size: Dimensions,
++    pub upscale_size: Dimensions,
++    pub frame_time_delta: f32,
++    pub enable_sharpening: bool,
++    pub sharpness: f32,
++    pub pre_exposure: f32,
++    pub view_space_to_meters_factor: f32,
++    pub camera_near: f32,
++    pub camera_far: f32,
++    pub camera_fov_angle_vertical: f32,
++    pub flags: u32,
++}
++
++/// `FFX_API_DISPATCH_DESC_TYPE_UPSCALE` (`ffx_upscale.h`).
++pub const DISPATCH_DESC_TYPE_UPSCALE: u64 = 0x0001_0001;
++
++/// What the title last handed the upscaler: what frame generation reads.
++#[derive(Clone, Copy, Debug)]
++pub struct Inputs {
++    /// Title objects (D3D12.X resources), as addresses.
++    pub depth: usize,
++    pub motion_vectors: usize,
++    pub output: usize,
++    pub depth_desc: ResourceDescription,
++    pub motion_desc: ResourceDescription,
++    pub output_desc: ResourceDescription,
++    pub jitter: Float2,
++    pub motion_vector_scale: Float2,
++    pub render_size: Dimensions,
++    pub upscale_size: Dimensions,
++    pub frame_time_delta: f32,
++    pub camera_near: f32,
++    pub camera_far: f32,
++    pub fov_y: f32,
++    /// Counts upscale dispatches; a frame generator sees a new frame by it.
++    pub serial: u64,
++}
++
++static LATEST: Mutex<Option<Inputs>> = Mutex::new(None);
++static UPSCALES: AtomicU64 = AtomicU64::new(0);
++static ORIGINAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
++
++/// The title loader's own `ffxDispatch`, found once its DLL is mapped.
++pub fn set_original_dispatch(address: usize) {
++    ORIGINAL_DISPATCH.store(address, Ordering::Release);
++    tracing::info!(address = format_args!("{address:#x}"), "ffx: the title's ffxDispatch is wrapped");
++}
++
++/// The newest upscale inputs, if the title has upscaled yet.
++pub fn latest() -> Option<Inputs> {
++    *LATEST.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Reads an upscale dispatch into [`Inputs`]; `serial` numbers it.
++pub fn inputs_of(d: &DispatchUpscale, serial: u64) -> Inputs {
++    Inputs {
++        depth: d.depth.resource as usize,
++        motion_vectors: d.motion_vectors.resource as usize,
++        output: d.output.resource as usize,
++        depth_desc: d.depth.description,
++        motion_desc: d.motion_vectors.description,
++        output_desc: d.output.description,
++        jitter: d.jitter_offset,
++        motion_vector_scale: d.motion_vector_scale,
++        render_size: d.render_size,
++        upscale_size: d.upscale_size,
++        frame_time_delta: d.frame_time_delta,
++        camera_near: d.camera_near,
++        camera_far: d.camera_far,
++        fov_y: d.camera_fov_angle_vertical,
++        serial,
++    }
++}
++
++/// The upscale descriptor in the chain starting at `desc`, if there is one.
++///
++/// # Safety
++/// `desc` is null or the start of a chain of valid headers.
++pub unsafe fn find_upscale(mut desc: *const Header) -> Option<*const DispatchUpscale> {
++    // A chain is a handful of links; the bound guards a cycle.
++    for _ in 0..64 {
++        // SAFETY: the caller's contract, one link at a time.
++        let header = unsafe { desc.as_ref() }?;
++        if header.kind == DISPATCH_DESC_TYPE_UPSCALE {
++            return Some(desc.cast());
++        }
++        desc = header.next;
++    }
++    None
++}
++
++type Dispatch = unsafe extern "system" fn(*mut c_void, *const Header) -> i32;
++
++/// `ffxReturnCode_t ffxDispatch(ffxContext*, const ffxDispatchDescHeader*)`.
++extern "system" fn ffxDispatch(context: *mut c_void, desc: *const Header) -> i32 {
++    // SAFETY: the title passes a valid chain to its own loader.
++    if let Some(up) = unsafe { find_upscale(desc) } {
++        let serial = UPSCALES.fetch_add(1, Ordering::Relaxed) + 1;
++        // SAFETY: `find_upscale` found a header of this type.
++        let d = unsafe { &*up };
++        let inputs = inputs_of(d, serial);
++        if serial <= 3 || serial.is_power_of_two() {
++            tracing::info!(
++                serial,
++                render = format_args!("{}x{}", d.render_size.width, d.render_size.height),
++                upscale = format_args!("{}x{}", d.upscale_size.width, d.upscale_size.height),
++                color = ?d.color.description,
++                depth = ?d.depth.description,
++                motion = ?d.motion_vectors.description,
++                output = ?d.output.description,
++                jitter = ?d.jitter_offset,
++                mv_scale = ?d.motion_vector_scale,
++                dt = d.frame_time_delta,
++                near = d.camera_near,
++                far = d.camera_far,
++                fov = d.camera_fov_angle_vertical,
++                flags = format_args!("{:#x}", d.flags),
++                "ffx: upscale dispatch"
++            );
++        }
++        *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(inputs);
++        #[cfg(windows)]
++        victory_gpu::dlssg::record(victory_gpu::dlssg::Inputs {
++            depth: inputs.depth,
++            depth_state: d.depth.state,
++            motion_vectors: inputs.motion_vectors,
++            motion_state: d.motion_vectors.state,
++            render: (d.render_size.width, d.render_size.height),
++            upscale: (d.upscale_size.width, d.upscale_size.height),
++            jitter: (d.jitter_offset.x, d.jitter_offset.y),
++            motion_vector_scale: (d.motion_vector_scale.x, d.motion_vector_scale.y),
++            near: d.camera_near,
++            far: d.camera_far,
++            fov_y: d.camera_fov_angle_vertical,
++            // FFX_UPSCALE_FLAG... none says "reset"; the first frame is one.
++            reset: serial == 1,
++        });
++    } else {
++        // SAFETY: as above; only the first header is read.
++        let kind = unsafe { desc.as_ref() }.map_or(0, |h| h.kind);
++        static OTHER: AtomicU64 = AtomicU64::new(0);
++        if OTHER.fetch_add(1, Ordering::Relaxed) < 8 {
++            tracing::info!(kind = format_args!("{kind:#x}"), "ffx: other dispatch");
++        }
++    }
++    let original = ORIGINAL_DISPATCH.load(Ordering::Acquire);
++    if original == 0 {
++        tracing::error!("ffx: ffxDispatch called before the title's loader was found");
++        return 1; // FFX_API_RETURN_ERROR
++    }
++    // SAFETY: the title loader's own export, with the title's arguments.
++    unsafe { std::mem::transmute::<usize, Dispatch>(original)(context, desc) }
++}
++
++/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE` (`ffx_upscale.h`).
++pub const CREATE_CONTEXT_DESC_TYPE_UPSCALE: u64 = 0x0001_0000;
++
++/// `ffxCreateContextDescUpscale`, up to its sizes.
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct CreateUpscale {
++    pub header: Header,
++    pub flags: u32,
++    pub max_render_size: Dimensions,
++    pub max_upscale_size: Dimensions,
++}
++
++static ORIGINAL_CREATE: AtomicUsize = AtomicUsize::new(0);
++static ORIGINAL_QUERY: AtomicUsize = AtomicUsize::new(0);
++
++/// The title loader's own `ffxCreateContext` / `ffxQuery`, found once its DLL
++/// is mapped: ours log what the title asks and what the loader answers.
++pub fn set_original(name: &str, address: usize) {
++    match name {
++        "ffxCreateContext" => ORIGINAL_CREATE.store(address, Ordering::Release),
++        "ffxQuery" => ORIGINAL_QUERY.store(address, Ordering::Release),
++        _ => {}
++    }
++}
++
++/// The kinds of a descriptor chain, first to last (at most 8).
++///
++/// # Safety
++/// `desc` is null or the start of a chain of valid headers.
++unsafe fn kinds(mut desc: *const Header) -> Vec<u64> {
++    let mut out = Vec::new();
++    while out.len() < 8 {
++        // SAFETY: the caller's contract, one link at a time.
++        let Some(header) = (unsafe { desc.as_ref() }) else { break };
++        out.push(header.kind);
++        desc = header.next;
++    }
++    out
++}
++
++type Create = unsafe extern "system" fn(*mut c_void, *const Header, *const c_void) -> i32;
++type Query = unsafe extern "system" fn(*mut c_void, *const Header) -> i32;
++
++/// `ffxReturnCode_t ffxCreateContext(ffxContext*, ffxCreateContextDescHeader*, const ffxAllocationCallbacks*)`.
++extern "system" fn ffxCreateContext(context: *mut c_void, desc: *const Header, memory: *const c_void) -> i32 {
++    let original = ORIGINAL_CREATE.load(Ordering::Acquire);
++    if original == 0 {
++        tracing::error!("ffx: ffxCreateContext called before the title's loader was found");
++        return 1;
++    }
++    // SAFETY: the title loader's own export, with the title's arguments.
++    let r = unsafe { std::mem::transmute::<usize, Create>(original)(context, desc, memory) };
++    static N: AtomicU64 = AtomicU64::new(0);
++    if N.fetch_add(1, Ordering::Relaxed) < 16 {
++        // SAFETY: the title passes a valid chain to its own loader.
++        let chain = unsafe { kinds(desc) };
++        let upscale = (!desc.is_null() && unsafe { (*desc).kind } == CREATE_CONTEXT_DESC_TYPE_UPSCALE)
++            // SAFETY: a header of this type starts this descriptor.
++            .then(|| unsafe { *desc.cast::<CreateUpscale>() });
++        tracing::info!(
++            result = r,
++            chain = ?chain.iter().map(|k| format!("{k:#x}")).collect::<Vec<_>>(),
++            flags = upscale.map(|u| format!("{:#x}", u.flags)),
++            max_render = upscale.map(|u| format!("{}x{}", u.max_render_size.width, u.max_render_size.height)),
++            max_upscale = upscale.map(|u| format!("{}x{}", u.max_upscale_size.width, u.max_upscale_size.height)),
++            "ffx: ffxCreateContext"
++        );
++    }
++    r
++}
++
++/// `ffxReturnCode_t ffxQuery(ffxContext*, ffxQueryDescHeader*)`.
++extern "system" fn ffxQuery(context: *mut c_void, desc: *const Header) -> i32 {
++    let original = ORIGINAL_QUERY.load(Ordering::Acquire);
++    if original == 0 {
++        tracing::error!("ffx: ffxQuery called before the title's loader was found");
++        return 1;
++    }
++    // SAFETY: the title loader's own export, with the title's arguments.
++    let r = unsafe { std::mem::transmute::<usize, Query>(original)(context, desc) };
++    static N: AtomicU64 = AtomicU64::new(0);
++    if N.fetch_add(1, Ordering::Relaxed) < 16 {
++        // SAFETY: as above.
++        let chain = unsafe { kinds(desc) };
++        tracing::info!(
++            result = r,
++            chain = ?chain.iter().map(|k| format!("{k:#x}")).collect::<Vec<_>>(),
++            "ffx: ffxQuery"
++        );
++    }
++    r
++}
++
++pub(crate) fn module() -> HleModule {
++    HleModule {
++        name: "ffx",
++        dlls: &["amd_fidelityfx_loader_xbox.dll"],
++        exports: vec![hle_export!(ffxDispatch), hle_export!(ffxCreateContext), hle_export!(ffxQuery)],
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The layout of AMD's `ffx_api_types.h` on x64.
++    #[test]
++    fn layouts_match_ffx_api() {
++        assert_eq!(size_of::<Header>(), 16);
++        assert_eq!(size_of::<ResourceDescription>(), 32);
++        assert_eq!(size_of::<Resource>(), 48);
++        assert_eq!(std::mem::offset_of!(DispatchUpscale, command_list), 16);
++        assert_eq!(std::mem::offset_of!(DispatchUpscale, color), 24);
++        assert_eq!(std::mem::offset_of!(DispatchUpscale, jitter_offset), 24 + 7 * 48);
++        assert_eq!(std::mem::offset_of!(DispatchUpscale, render_size), 24 + 7 * 48 + 16);
++        assert_eq!(std::mem::offset_of!(CreateUpscale, flags), 16);
++        assert_eq!(std::mem::offset_of!(CreateUpscale, max_render_size), 20);
++        assert_eq!(std::mem::offset_of!(CreateUpscale, max_upscale_size), 28);
++    }
++
++    #[test]
++    fn the_upscale_link_is_found_in_a_chain() {
++        let mut up: DispatchUpscale = unsafe { std::mem::zeroed() };
++        up.header.kind = DISPATCH_DESC_TYPE_UPSCALE;
++        up.render_size = Dimensions { width: 1280, height: 720 };
++        let first = Header { kind: 0x1234, next: (&raw const up).cast() };
++        let found = unsafe { find_upscale(&first) }.expect("found");
++        assert_eq!(unsafe { (*found).render_size.width }, 1280);
++        let lone = Header { kind: 0x1234, next: std::ptr::null() };
++        assert!(unsafe { find_upscale(&lone) }.is_none());
++        assert!(unsafe { find_upscale(std::ptr::null()) }.is_none());
++    }
++
++    /// The title imports these from its loader by name; ours must win the bind
++    /// (HLE before the title DLL's own exports), else no call is ever seen.
++    #[test]
++    fn the_title_imports_bind_to_our_wrappers() {
++        for dll in ["amd_fidelityfx_loader_xbox.dll", "AMD_FIDELITYFX_LOADER_XBOX.DLL"] {
++            for name in ["ffxDispatch", "ffxCreateContext", "ffxQuery"] {
++                assert!(crate::registry::lookup(dll, name).is_some(), "{dll}!{name}");
++            }
++        }
++        assert!(!crate::registry::replaces("amd_fidelityfx_loader_xbox.dll"));
++    }
++}
+diff --git a/third_party/victory/crates/victory-hle/src/modules/mod.rs b/third_party/victory/crates/victory-hle/src/modules/mod.rs
+index 49f68e5..883397d 100644
+--- a/third_party/victory/crates/victory-hle/src/modules/mod.rs
++++ b/third_party/victory/crates/victory-hle/src/modules/mod.rs
+@@ -19,6 +19,7 @@ pub mod dstorage;
+ #[cfg(windows)]
+ pub mod fidelityfx;
+ #[cfg(windows)]
++pub mod ffx;
+ pub mod files;
+ pub mod gameinput;
+ pub mod kernel;
+@@ -56,6 +57,7 @@ pub(crate) fn all() -> Vec<HleModule> {
+         audio::module(),
+         dsp::module(),
+         xg::module(),
++        ffx::module(),
+     ];
+     #[cfg(windows)]
+     all.push(apu::module());
+diff --git a/third_party/victory/crates/victory-hle/src/registry.rs b/third_party/victory/crates/victory-hle/src/registry.rs
+index e8744b4..86108ad 100644
+--- a/third_party/victory/crates/victory-hle/src/registry.rs
++++ b/third_party/victory/crates/victory-hle/src/registry.rs
+@@ -53,6 +53,16 @@ pub fn registry() -> &'static [HleModule] {
+     &REGISTRY
+ }
+ 
++/// Modules that take over a few exports of a title DLL and call the rest
++/// through it: the title's own DLL is still loaded for them.
++const WRAPPERS: &[&str] = &["ffx"];
++
++/// Whether `dll` is replaced by our modules (the title's own copy is then
++/// not loaded); a DLL only wrapped (`WRAPPERS`) is still loaded.
++pub fn replaces(dll: &str) -> bool {
++    registry().iter().any(|m| m.serves(dll) && !WRAPPERS.contains(&m.name))
++}
++
+ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
+     registry()
+         .iter()
+diff --git a/third_party/victory/native/victory_sl/build.bat b/third_party/victory/native/victory_sl/build.bat
+new file mode 100644
+index 0000000..eb96604
+--- /dev/null
++++ b/third_party/victory/native/victory_sl/build.bat
+@@ -0,0 +1,9 @@
++@echo off
++rem Builds victory_sl.dll against the Streamline SDK. Usage: build.bat <streamline sdk root> <out dir>
++setlocal
++set SL=%~1
++set OUT=%~2
++call "F:\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
++if not exist "%OUT%" mkdir "%OUT%"
++cl /nologo /LD /EHsc /O2 /std:c++17 /W3 /I "%SL%\include" "%~dp0victory_sl.cpp" /Fo"%OUT%\\" /Fe"%OUT%\victory_sl.dll" /link /LIBPATH:"%SL%\lib\x64" sl.interposer.lib d3d12.lib dxgi.lib || exit /b 1
++echo built %OUT%\victory_sl.dll
+diff --git a/third_party/victory/native/victory_sl/victory_sl.cpp b/third_party/victory/native/victory_sl/victory_sl.cpp
+new file mode 100644
+index 0000000..0186666
+--- /dev/null
++++ b/third_party/victory/native/victory_sl/victory_sl.cpp
+@@ -0,0 +1,289 @@
++// victory_sl.dll: a small C bridge between VIctory (Rust) and NVIDIA Streamline
++// (C++), for DLSS Frame Generation on VIctory's own swap chain.
++//
++// VIctory owns the D3D12 device, queue and swap chain, so this uses
++// Streamline's manual hooking: the queue is made through Streamline's proxy
++// device and the swap chain through its proxy factory; everything else stays
++// native. Each frame VIctory hands over the title's depth and motion vectors
++// (copied by Streamline when tagged), the camera constants it has, and the
++// Reflex/PCL markers DLSS-G requires.
++//
++// Built against the Streamline SDK headers and sl.interposer.lib
++// (see build.ps1). Over-the-air plugin downloads are off.
++
++#include <windows.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <share.h>
++
++#include <sl.h>
++#include <sl_consts.h>
++#include <sl_hooks.h>
++#include <sl_dlss_g.h>
++#include <sl_reflex.h>
++#include <sl_pcl.h>
++
++#define VSL_API extern "C" __declspec(dllexport)
++
++namespace {
++
++std::mutex g_lock;
++bool g_ready = false;
++sl::FrameToken* g_frame = nullptr;
++uint32_t g_frameIndex = 0;
++int g_framesToGenerate = 0;
++sl::ViewportHandle g_viewport{0};
++FILE* g_log = nullptr;
++
++void logf(const char* fmt, ...) {
++    if (!g_log) return;
++    va_list args;
++    va_start(args, fmt);
++    vfprintf(g_log, fmt, args);
++    va_end(args);
++    fputc('\n', g_log);
++    fflush(g_log);
++}
++
++void slLog(sl::LogType type, const char* msg) {
++    logf("[sl %d] %s", (int)type, msg);
++}
++
++sl::float4x4 identity() {
++    sl::float4x4 m{};
++    m.row[0] = {1, 0, 0, 0};
++    m.row[1] = {0, 1, 0, 0};
++    m.row[2] = {0, 0, 1, 0};
++    m.row[3] = {0, 0, 0, 1};
++    return m;
++}
++
++// A left-handed perspective projection (row-vector convention, as SL wants),
++// from the field of view the title gave its upscaler. With `inverted` the
++// depth runs far=0, near=1 (reversed Z).
++sl::float4x4 perspective(float fovY, float aspect, float nearZ, float farZ, bool inverted) {
++    float y = 1.0f / std::tan(fovY * 0.5f);
++    float x = y / aspect;
++    float n = inverted ? farZ : nearZ;
++    float f = inverted ? nearZ : farZ;
++    if (!std::isfinite(f) || f <= 0.0f) f = 1.0e6f;
++    float a = f / (f - n);
++    sl::float4x4 m{};
++    m.row[0] = {x, 0, 0, 0};
++    m.row[1] = {0, y, 0, 0};
++    m.row[2] = {0, 0, a, 1};
++    m.row[3] = {0, 0, -n * a, 0};
++    return m;
++}
++
++}  // namespace
++
++// What VIctory knows of a frame.
++struct VslFrame {
++    void* depth;        // ID3D12Resource*
++    uint32_t depthState;  // D3D12_RESOURCE_STATES
++    void* mvec;
++    uint32_t mvecState;
++    uint32_t renderWidth, renderHeight;    // where depth/mvec are valid
++    uint32_t outputWidth, outputHeight;    // the back buffer
++    float jitterX, jitterY;                // in render pixels
++    float mvecScaleX, mvecScaleY;          // to bring motion vectors to [-1,1]
++    float nearZ, farZ, fovY;
++    int32_t depthInverted;
++    int32_t reset;
++};
++
++// 0 = ok. `pluginDir`: where sl.*.dll and nvngx_dlssg.dll are. `logPath`:
++// a text log of this bridge and of Streamline (null: none).
++VSL_API int vsl_init(const wchar_t* pluginDir, const wchar_t* logPath) {
++    std::lock_guard<std::mutex> guard(g_lock);
++    if (logPath && !g_log) g_log = _wfsopen(logPath, L"w", _SH_DENYNO);
++    sl::Preferences pref{};
++    pref.showConsole = false;
++    pref.logLevel = sl::LogLevel::eDefault;
++    pref.logMessageCallback = slLog;
++    const wchar_t* paths[] = {pluginDir};
++    pref.pathsToPlugins = paths;
++    pref.numPathsToPlugins = 1;
++    // Manual hooking; no over-the-air downloads.
++    // Frame-based tagging: slSetTagForFrame is refused (eErrorInvalidIntegration) without it.
++    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking |
++                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
++    sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
++    pref.featuresToLoad = features;
++    pref.numFeaturesToLoad = 3;
++    // No NVIDIA application id: NGX (which DLSS-G needs) then wants the
++    // engine's version and a project GUID, or it disables every NGX feature
++    // ("Please provide correct application id when calling slInit").
++    pref.engine = sl::EngineType::eCustom;
++    pref.engineVersion = "1.0.0";
++    pref.projectId = "c6a3dbdc-bb28-4a3e-8316-a32bd8a3df73";
++    pref.renderAPI = sl::RenderAPI::eD3D12;
++    sl::Result r = slInit(pref);
++    logf("slInit -> %d", (int)r);
++    return (int)r;
++}
++
++VSL_API int vsl_set_device(void* device) {
++    sl::Result r = slSetD3DDevice(device);
++    logf("slSetD3DDevice -> %d", (int)r);
++    return (int)r;
++}
++
++// Makes the queue through Streamline's proxy device (a mandatory hook).
++VSL_API int vsl_create_queue(void* nativeDevice, const D3D12_COMMAND_QUEUE_DESC* desc, void** queue) {
++    ID3D12Device* proxy = static_cast<ID3D12Device*>(nativeDevice);
++    proxy->AddRef();
++    sl::Result r = slUpgradeInterface(reinterpret_cast<void**>(&proxy));
++    if (r != sl::Result::eOk) {
++        proxy->Release();
++        logf("slUpgradeInterface(device) -> %d", (int)r);
++        return (int)r;
++    }
++    HRESULT hr = proxy->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), queue);
++    logf("proxy CreateCommandQueue -> %08x", (unsigned)hr);
++    return SUCCEEDED(hr) ? 0 : (int)hr;
++}
++
++// Replaces `*object` (an IDXGIFactory* or IDXGISwapChain*) with its proxy.
++VSL_API int vsl_upgrade(void** object) {
++    sl::Result r = slUpgradeInterface(object);
++    logf("slUpgradeInterface -> %d", (int)r);
++    return (int)r;
++}
++
++// Whether DLSS-G may run on the adapter with this LUID; `maxGenerated`: the
++// most frames it may generate per real one (0 if unsupported).
++VSL_API int vsl_check(uint32_t luidLow, int32_t luidHigh, int* maxGenerated) {
++    LUID luid{luidLow, luidHigh};
++    sl::AdapterInfo info{};
++    info.deviceLUID = reinterpret_cast<uint8_t*>(&luid);
++    info.deviceLUIDSizeInBytes = sizeof(LUID);
++    sl::Result r = slIsFeatureSupported(sl::kFeatureDLSS_G, info);
++    logf("slIsFeatureSupported(DLSS_G) -> %d", (int)r);
++    *maxGenerated = 0;
++    sl::DLSSGState state{};
++    if (slDLSSGGetState(g_viewport, state, nullptr) == sl::Result::eOk) {
++        *maxGenerated = (int)state.numFramesToGenerateMax;
++        logf("DLSS-G state: status %u, max frames to generate %u, min width/height %u",
++             (unsigned)state.status, (unsigned)state.numFramesToGenerateMax,
++             (unsigned)state.minWidthOrHeight);
++    }
++    return (int)r;
++}
++
++// Frame generation on (`frames` generated per real frame) or off (0).
++VSL_API int vsl_set_options(int frames, uint32_t width, uint32_t height) {
++    sl::DLSSGOptions o{};
++    o.mode = frames > 0 ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
++    o.numFramesToGenerate = frames > 0 ? (uint32_t)frames : 1;
++    o.colorWidth = width;
++    o.colorHeight = height;
++    sl::Result r = slDLSSGSetOptions(g_viewport, o);
++    logf("slDLSSGSetOptions(frames %d) -> %d", frames, (int)r);
++    g_framesToGenerate = frames;
++    return (int)r;
++}
++
++// Reflex must run for DLSS-G: low latency mode on, no frame cap.
++VSL_API int vsl_reflex_on() {
++    sl::ReflexOptions o{};
++    o.mode = sl::ReflexMode::eLowLatency;
++    sl::Result r = slReflexSetOptions(o);
++    logf("slReflexSetOptions -> %d", (int)r);
++    return (int)r;
++}
++
++// The start of a frame: a new token and the simulation markers.
++VSL_API int vsl_frame_begin() {
++    sl::Result r = slGetNewFrameToken(g_frame, nullptr);
++    if (r != sl::Result::eOk || !g_frame) return (int)r;
++    g_frameIndex = *g_frame;
++    slPCLSetMarker(sl::PCLMarker::eSimulationStart, *g_frame);
++    slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *g_frame);
++    slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *g_frame);
++    return 0;
++}
++
++// Constants and tags for the frame, recorded on `cmdList` (Streamline copies
++// the tagged resources there: they are only valid now).
++VSL_API int vsl_frame_inputs(void* cmdList, const VslFrame* f) {
++    if (!g_frame) return -1;
++    float aspect = f->renderHeight ? (float)f->renderWidth / (float)f->renderHeight : 16.0f / 9.0f;
++    bool inverted = f->depthInverted != 0;
++    sl::Constants c{};
++    c.cameraViewToClip = perspective(f->fovY, aspect, f->nearZ, f->farZ, inverted);
++    // shortcut: no view matrices from the title; motion vectors carry the
++    // camera's motion, so the clip-to-previous-clip transform is identity.
++    sl::float4x4 view = c.cameraViewToClip;
++    c.clipToCameraView = identity();
++    {
++        // Inverse of the diagonal-ish projection above.
++        float x = view.row[0].x, y = view.row[1].y, a = view.row[2].z, b = view.row[3].z;
++        sl::float4x4 inv{};
++        inv.row[0] = {1.0f / x, 0, 0, 0};
++        inv.row[1] = {0, 1.0f / y, 0, 0};
++        inv.row[2] = {0, 0, 0, 1.0f / b};
++        inv.row[3] = {0, 0, 1, -a / b};
++        c.clipToCameraView = inv;
++    }
++    c.clipToLensClip = identity();
++    c.clipToPrevClip = identity();
++    c.prevClipToClip = identity();
++    c.jitterOffset = {f->jitterX, f->jitterY};
++    c.mvecScale = {f->mvecScaleX, f->mvecScaleY};
++    c.cameraPinholeOffset = {0, 0};
++    c.cameraPos = {0, 0, 0};
++    c.cameraUp = {0, 1, 0};
++    c.cameraRight = {1, 0, 0};
++    c.cameraFwd = {0, 0, 1};
++    c.cameraNear = f->nearZ;
++    c.cameraFar = f->farZ;
++    c.cameraFOV = f->fovY;
++    c.cameraAspectRatio = aspect;
++    c.depthInverted = inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++    c.cameraMotionIncluded = sl::Boolean::eTrue;
++    c.motionVectors3D = sl::Boolean::eFalse;
++    c.reset = f->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++    c.motionVectorsJittered = sl::Boolean::eFalse;
++    sl::Result r = slSetConstants(c, *g_frame, g_viewport);
++    if (r != sl::Result::eOk) logf("slSetConstants -> %d", (int)r);
++
++    sl::Extent render{0, 0, f->renderWidth, f->renderHeight};
++    sl::Extent output{0, 0, f->outputWidth, f->outputHeight};
++    sl::Resource depth{sl::ResourceType::eTex2d, f->depth, nullptr, nullptr, f->depthState};
++    sl::Resource mvec{sl::ResourceType::eTex2d, f->mvec, nullptr, nullptr, f->mvecState};
++    sl::ResourceTag tags[] = {
++        sl::ResourceTag{&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &render},
++        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &render},
++        sl::ResourceTag{nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle{}, &output},
++    };
++    sl::Result t = slSetTagForFrame(*g_frame, g_viewport, tags, 3,
++                                    reinterpret_cast<sl::CommandBuffer*>(cmdList));
++    if (t != sl::Result::eOk) logf("slSetTagForFrame -> %d", (int)t);
++    return (int)(r != sl::Result::eOk ? r : t);
++}
++
++VSL_API void vsl_present_start() {
++    if (!g_frame) return;
++    slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *g_frame);
++    slPCLSetMarker(sl::PCLMarker::ePresentStart, *g_frame);
++}
++
++VSL_API void vsl_present_end() {
++    if (!g_frame) return;
++    slPCLSetMarker(sl::PCLMarker::ePresentEnd, *g_frame);
++}
++
++VSL_API int vsl_shutdown() {
++    sl::Result r = slShutdown();
++    logf("slShutdown -> %d", (int)r);
++    if (g_log) fclose(g_log);
++    g_log = nullptr;
++    return (int)r;
++}
+-- 
+2.55.0.windows.3
+

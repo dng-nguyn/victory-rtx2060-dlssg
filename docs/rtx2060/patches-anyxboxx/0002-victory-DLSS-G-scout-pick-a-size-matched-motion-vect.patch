@@ -1,0 +1,70 @@
+From fe4234e3bf1cf48c27b78379b7b9149a595c0838 Mon Sep 17 00:00:00 2001
+From: dng-nguyn <dungnguyen@dinhcap.dev>
+Date: Thu, 26 Nov 2026 13:15:18 +0700
+Subject: [PATCH 2/2] victory DLSS-G scout: pick a size-matched
+ motion-vector/depth pair
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../victory/crates/victory-gpu/src/dlssg.rs   | 34 +++++++++++--------
+ 1 file changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/third_party/victory/crates/victory-gpu/src/dlssg.rs b/third_party/victory/crates/victory-gpu/src/dlssg.rs
+index 9082fef..a38e167 100644
+--- a/third_party/victory/crates/victory-gpu/src/dlssg.rs
++++ b/third_party/victory/crates/victory-gpu/src/dlssg.rs
+@@ -109,32 +109,36 @@ fn knob(name: &str, default: f32) -> f32 {
+ /// are then cleared): `None` while nothing fits.
+ fn scouted(output: (u32, u32)) -> Option<Inputs> {
+     let taken = SCOUT.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+-    // The main depth: the largest area, then the most binds.
+-    let mut depth: Option<(usize, (u32, u32), u32)> = None;
++    // The pair: a two-channel 16-bit target and a depth buffer of the same
++    // size, the most bound such target. Size alone misleads: the shadow
++    // atlas (2048x8192 in the prologue) is the largest depth buffer and
++    // has no motion vectors beside it.
++    let mut depth_sizes: Vec<(usize, (u32, u32), u32)> = Vec::new();
+     for (&d, &binds) in &taken.depths {
+-        let Some((t, _)) = crate::resource::host_texture_now(d as crate::object::This) else { continue };
+-        let size = size_of_texture(&t);
+-        let better = depth.is_none_or(|(_, s, b)| (size.0 * size.1, binds) > (s.0 * s.1, b));
+-        if better {
+-            depth = Some((d, size, binds));
++        if let Some((t, _)) = crate::resource::host_texture_now(d as crate::object::This) {
++            depth_sizes.push((d, size_of_texture(&t), binds));
+         }
+     }
+-    let (depth, size, depth_binds) = depth?;
+-    // The motion vectors: a two-channel 16-bit target of the depth's size,
+-    // the most bound.
+-    let mut mvec: Option<(usize, i32, u32)> = None;
++    let mut best: Option<(usize, i32, u32, usize, (u32, u32), u32)> = None; // mvec, fmt, binds, depth, size, depth binds
+     for (&c, &(format, binds)) in &taken.colors {
+         if !motion_format(format) {
+             continue;
+         }
+         let Some((t, _)) = crate::resource::host_texture_now(c as crate::object::This) else { continue };
+-        if size_of_texture(&t) != size {
++        let size = size_of_texture(&t);
++        // The most bound depth buffer of that size.
++        let Some(&(d, _, db)) = depth_sizes.iter().filter(|(_, s, _)| *s == size).max_by_key(|(_, _, b)| *b) else {
+             continue;
+-        }
+-        if mvec.is_none_or(|(_, _, b)| binds > b) {
+-            mvec = Some((c, format, binds));
++        };
++        if best.is_none_or(|(_, _, b, _, _, _)| binds > b) {
++            best = Some((c, format, binds, d, size, db));
+         }
+     }
++    let (depth, size, depth_binds) = match best {
++        Some((_, _, _, d, s, db)) => (d, s, db),
++        None => depth_sizes.iter().max_by_key(|(_, s, b)| (s.0 * s.1, *b)).map(|&(d, s, b)| (d, s, b))?,
++    };
++    let mvec = best.map(|(c, f, b, _, _, _)| (c, f, b));
+     static PICKS: AtomicU64 = AtomicU64::new(0);
+     let n = PICKS.fetch_add(1, Ordering::Relaxed);
+     if n < 4 || n.is_power_of_two() {
+-- 
+2.55.0.windows.3
+
