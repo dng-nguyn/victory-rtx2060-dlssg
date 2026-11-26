@@ -111,7 +111,9 @@ VSL_API int vsl_init(const wchar_t* pluginDir, const wchar_t* logPath) {
     pref.pathsToPlugins = paths;
     pref.numPathsToPlugins = 1;
     // Manual hooking; no over-the-air downloads.
-    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking;
+    // Frame-based tagging: slSetTagForFrame is refused (eErrorInvalidIntegration) without it.
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking |
+                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
     pref.featuresToLoad = features;
     pref.numFeaturesToLoad = 3;

@@ -801,6 +801,14 @@ impl State {
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        if crate::dlssg::scouting() {
+            let colors: Vec<(usize, i32)> = handles
+                .iter()
+                .filter_map(|&h| crate::descriptor::rtv_record(h))
+                .map(|r| (r.resource as usize, r.desc().map_or(0, |d| d.Format.0)))
+                .collect();
+            crate::dlssg::note_targets(&colors, self.depth);
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(

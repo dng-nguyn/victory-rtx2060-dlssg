@@ -54,6 +54,130 @@ pub fn record(inputs: Inputs) {
     *INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(inputs);
 }
 
+/// The render targets and depth buffers the title binds, by title object,
+/// counted over the frame (`VICTORY_DLSSG` on only). The title does not hand
+/// its depth and motion vectors to an upscaler in every mode, so frame
+/// generation picks them from what it draws into: the main depth buffer is
+/// the largest, most used one; the motion vectors a two-channel 16-bit
+/// target of the same size.
+#[derive(Default)]
+struct Scout {
+    colors: std::collections::HashMap<usize, (i32, u32)>, // (view format, binds)
+    depths: std::collections::HashMap<usize, u32>,       // binds
+}
+
+static SCOUT: Mutex<Option<Scout>> = Mutex::new(None);
+
+/// Whether binds are counted (frame generation on).
+pub(crate) fn scouting() -> bool {
+    frames() > 0
+}
+
+/// One `OMSetRenderTargets` of the title: its targets (object, view format)
+/// and depth buffer (0 if none).
+pub(crate) fn note_targets(colors: &[(usize, i32)], depth: usize) {
+    let mut g = SCOUT.lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.get_or_insert_with(Scout::default);
+    for &(c, format) in colors {
+        let e = s.colors.entry(c).or_insert((format, 0));
+        e.0 = format;
+        e.1 += 1;
+    }
+    if depth != 0 {
+        *s.depths.entry(depth).or_insert(0) += 1;
+    }
+}
+
+fn size_of_texture(t: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> (u32, u32) {
+    // SAFETY: a live resource.
+    let d = unsafe { t.GetDesc() };
+    (d.Width as u32, d.Height)
+}
+
+/// `R16G16_FLOAT`, `R16G16_UNORM`, `R16G16_SNORM`, `R16G16_SINT` and
+/// `R32G32_FLOAT`: what motion vectors are drawn into.
+fn motion_format(format: i32) -> bool {
+    matches!(format, 34 | 35 | 37 | 38 | 16)
+}
+
+/// A float from `VICTORY_DLSSG_<name>`, else `default`.
+fn knob(name: &str, default: f32) -> f32 {
+    std::env::var(format!("VICTORY_DLSSG_{name}")).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// The frame's picks, from the binds counted since the last present (which
+/// are then cleared): `None` while nothing fits.
+fn scouted(output: (u32, u32)) -> Option<Inputs> {
+    let taken = SCOUT.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    // The main depth: the largest area, then the most binds.
+    let mut depth: Option<(usize, (u32, u32), u32)> = None;
+    for (&d, &binds) in &taken.depths {
+        let Some((t, _)) = crate::resource::host_texture_now(d as crate::object::This) else { continue };
+        let size = size_of_texture(&t);
+        let better = depth.is_none_or(|(_, s, b)| (size.0 * size.1, binds) > (s.0 * s.1, b));
+        if better {
+            depth = Some((d, size, binds));
+        }
+    }
+    let (depth, size, depth_binds) = depth?;
+    // The motion vectors: a two-channel 16-bit target of the depth's size,
+    // the most bound.
+    let mut mvec: Option<(usize, i32, u32)> = None;
+    for (&c, &(format, binds)) in &taken.colors {
+        if !motion_format(format) {
+            continue;
+        }
+        let Some((t, _)) = crate::resource::host_texture_now(c as crate::object::This) else { continue };
+        if size_of_texture(&t) != size {
+            continue;
+        }
+        if mvec.is_none_or(|(_, _, b)| binds > b) {
+            mvec = Some((c, format, binds));
+        }
+    }
+    static PICKS: AtomicU64 = AtomicU64::new(0);
+    let n = PICKS.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || n.is_power_of_two() {
+        let colors: Vec<String> = taken
+            .colors
+            .iter()
+            .filter(|(_, (f, _))| motion_format(*f))
+            .map(|(c, (f, b))| format!("{c:#x}:fmt{f}x{b}"))
+            .collect();
+        tracing::info!(
+            depth = format_args!("{depth:#x}"),
+            size = format_args!("{}x{}", size.0, size.1),
+            depth_binds,
+            depths = taken.depths.len(),
+            mvec = ?mvec.map(|(c, f, b)| format!("{c:#x} fmt {f} x{b}")),
+            two_channel_targets = ?colors,
+            output = format_args!("{}x{}", output.0, output.1),
+            "dlssg: scouted the title's depth and motion vectors"
+        );
+    }
+    let (mvec, _, _) = mvec?;
+    // What the title's own data does not say: settable, logged above.
+    let fov = knob("FOV_DEG", 60.0).to_radians();
+    let inverted = knob("DEPTH_INVERTED", 1.0) != 0.0;
+    let (near, far) = (knob("NEAR", 0.1), knob("FAR", 10000.0));
+    Some(Inputs {
+        depth,
+        depth_state: 0,
+        motion_vectors: mvec,
+        motion_state: 0,
+        render: size,
+        upscale: output,
+        jitter: (0.0, 0.0),
+        // Multiplied by the render size below (`frame_inputs` divides by it):
+        // MVEC_SCALE is what SL wants, e.g. 1 for vectors in UV units.
+        motion_vector_scale: (knob("MVEC_SCALE_X", 1.0) * size.0 as f32, knob("MVEC_SCALE_Y", 1.0) * size.1 as f32),
+        near: if inverted { far } else { near },
+        far: if inverted { near } else { far },
+        fov_y: fov,
+        reset: n == 0,
+    })
+}
+
 /// Frames to generate per real one, 0 if off.
 pub fn frames() -> u32 {
     static N: OnceLock<u32> = OnceLock::new();
@@ -235,7 +359,9 @@ pub(crate) fn frame_begin() {
 /// recorded on `list` (Streamline copies the tagged textures there).
 pub(crate) fn frame_inputs(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, output: (u32, u32)) {
     let Some(b) = bridge() else { return };
-    let Some(i) = *INPUTS.lock().unwrap_or_else(|e| e.into_inner()) else {
+    // The upscaler's inputs if the title gave any, else the scouted ones.
+    let recorded = *INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = recorded.or_else(|| scouted(output)) else {
         return;
     };
     let depth = crate::resource::host_texture_now(i.depth as crate::object::This);
