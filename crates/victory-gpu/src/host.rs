@@ -5885,8 +5885,8 @@ impl Host {
             }
             working(false);
             match WaitForSingleObject(self.event, INFINITE) {
-                WAIT_OBJECT_0 => {}
-                WAIT_FAILED => {
+                windows::Win32::Foundation::WAIT_OBJECT_0 => {}
+                windows::Win32::Foundation::WAIT_FAILED => {
                     let error = windows::core::Error::from_thread();
                     fail(format_args!("could not wait for {context} ({error})"));
                 }
